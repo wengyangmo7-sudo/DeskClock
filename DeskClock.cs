@@ -44,20 +44,24 @@ static class DeskClock
     static WidgetForm form;
     static System.Windows.Forms.Timer timer;
     static ContextMenuStrip menu;
-    static ToolStripMenuItem[] bgItems;
-    static ToolStripMenuItem[] opacityItems;
-    static ToolStripMenuItem[] sizeItems;
-    static ToolStripMenuItem[] zItems;
+    static NotifyIcon tray;
+    static ContextMenuStrip trayMenu;
+    static SettingsForm settings;
+    static bool hidden = false;
+    static int msgTaskbarCreated = 0;
     static string settingsPath;
     static string startupLnk;
     static string renderKey = "";
     static bool dragging = false;
     static bool lastPushOk = false;
     static int lastPushErr = 0;
-    static bool shown = true;
+    static System.Windows.Forms.Timer saveTimer;
+    static DateTime nextRenderAt = DateTime.MinValue;
+    static DateTime nextMaintAt = DateTime.MinValue;
+    static Layout cacheLayout;
+    static string cacheKey = "";
     static bool zTest = false;
     static int zTick = 0;
-    static int zTickP = 0;
     static bool zDirty = false;
     static bool sinking = false;
     static Point dragCursor;
@@ -73,7 +77,11 @@ static class DeskClock
     [STAThread]
     static void Main(string[] args)
     {
-        bool preview = false, selfTest = false, visTest = false, menuShot = false;
+        AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { LogCrash(e.ExceptionObject as Exception); };
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e) { LogCrash(e.Exception); };
+
+        bool preview = false, selfTest = false, visTest = false, menuShot = false, settingsShot = false;
         int forceBg = -1;
         string wall = null, outDir = null;
         for (int i = 0; i < args.Length; i++)
@@ -82,6 +90,7 @@ static class DeskClock
             else if (args[i] == "--selftest") selfTest = true;
             else if (args[i] == "--vistest") visTest = true;
             else if (args[i] == "--menushot") menuShot = true;
+            else if (args[i] == "--settingsshot") settingsShot = true;
             else if (args[i] == "--ztest") zTest = true;
             else if (args[i] == "--bg" && i + 1 < args.Length) { int nb; if (int.TryParse(args[i + 1], out nb) && nb >= 0 && nb < 6) { forceBg = nb; i++; } }
             else if (args[i] == "--wall" && i + 1 < args.Length) wall = args[++i];
@@ -90,7 +99,7 @@ static class DeskClock
 
         bool created;
         mutex = new Mutex(true, "DeskClockWidget_SingleInstance", out created);
-        if (!created && !preview) return;   // 已有实例
+        if (!created && !preview && !selfTest && !visTest && !menuShot && !settingsShot && !zTest) return;   // 已有实例（自检模式除外）
 
         TryDpiAware();
         scale = GetDpiForSystem() / 96f;
@@ -112,7 +121,9 @@ static class DeskClock
         if (selfTest) { SelfTest(); return; }
         if (visTest) { VisTest(); return; }
         if (menuShot) { MakeMenuShot(); return; }
+        if (settingsShot) { MakeSettingsShot(); return; }
 
+        HealAutostart();
         form = new WidgetForm();
         form.FormBorderStyle = FormBorderStyle.None;
         form.ShowInTaskbar = false;
@@ -125,6 +136,7 @@ static class DeskClock
 
         BuildMenu();
         form.ContextMenuStrip = menu;
+        BuildTray();
         form.MouseDown += delegate(object s, MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left && !locked)
@@ -153,12 +165,18 @@ static class DeskClock
             else sizeIdx = Math.Max(0, sizeIdx - 1);
             SyncChecks();
             Dirty();
+            ScheduleSave();
         };
         form.FormClosing += delegate(object s, FormClosingEventArgs e)
         {
             Save();
+            if (tray != null) { tray.Visible = false; tray.Dispose(); tray = null; }
             ReleaseSurface();
         };
+
+        saveTimer = new System.Windows.Forms.Timer();   // 滚轮改字号后 0.5s 落盘，防止被强杀时丢失
+        saveTimer.Interval = 500;
+        saveTimer.Tick += delegate(object s, EventArgs e) { saveTimer.Stop(); Save(); };
 
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 200;
@@ -166,8 +184,31 @@ static class DeskClock
         timer.Start();
 
         Render();
+        renderKey = RenderKeyFor(DateTime.Now);
+        nextRenderAt = NextBoundary(DateTime.Now);
         RefreshCapture(true, true);
         Application.Run(form);
+    }
+
+    static void LogCrash(Exception ex)
+    {
+        string body = "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ====" + Environment.NewLine
+            + (ex == null ? "(no exception object)" : ex.ToString()) + Environment.NewLine + Environment.NewLine;
+        try { File.AppendAllText(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "crash.log"), body, Encoding.UTF8); return; } catch { }
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DeskClock");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "crash.log"), body, Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    static void ScheduleSave()
+    {
+        if (saveTimer == null) return;
+        saveTimer.Stop();
+        saveTimer.Start();
     }
 
     // ---------------- 主循环 ----------------
@@ -234,20 +275,80 @@ static class DeskClock
         try { File.WriteAllText(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "ztest.txt"), sb.ToString(), Encoding.UTF8); } catch { }
     }
 
-    static void OnTick()
+    static DateTime FloorTo(DateTime t, long ticks)
     {
-        ApplyVisibility();
-        if (zTest && ++zTick == 10) { WriteZTest(); Environment.Exit(0); }
-        if (BottomMode && (zDirty || (++zTickP % 5) == 0)) AssertBottom();
-        if (!shown) return;
-        DateTime now = DateTime.Now;
-        string key = (showSeconds ? now.ToString("HH:mm:ss") : now.ToString("HH:mm"))
-            + "|" + (showDate ? 1 : 0) + "|" + (hour24 ? 1 : 0)
-            + "|" + bgKind + "|" + bgOpacity + "|" + sizeIdx + "|" + scale.ToString("0.###");
-        if (key != renderKey) { renderKey = key; Render(); }
+        return new DateTime(t.Ticks - (t.Ticks % ticks), t.Kind);
     }
 
-    static void Dirty() { renderKey = ""; RefreshCapture(true, false); Render(); }
+    // 下一次需要刷新的时刻：开秒对齐到整秒，关秒对齐到整分
+    static DateTime NextBoundary(DateTime now)
+    {
+        return showSeconds
+            ? FloorTo(now, TimeSpan.TicksPerSecond).AddSeconds(1)
+            : FloorTo(now, TimeSpan.TicksPerMinute).AddMinutes(1);
+    }
+
+    static string RenderKeyFor(DateTime now)
+    {
+        return (showSeconds ? now.ToString("HH:mm:ss") : now.ToString("HH:mm"))
+            + "|" + (showDate ? 1 : 0) + "|" + (hour24 ? 1 : 0)
+            + "|" + bgKind + "|" + bgOpacity + "|" + sizeIdx + "|" + scale.ToString("0.###");
+    }
+
+    static void OnTick()
+    {
+        if (hidden)
+        {
+            if (timer != null && timer.Interval != 1000) timer.Interval = 1000;
+            return;
+        }
+
+        DateTime now = DateTime.Now;
+
+        // 一秒一次的兜底维护：z 序被别的窗口挪了就摆回去
+        if (BottomMode && (zDirty || now >= nextMaintAt))
+        {
+            zDirty = false;
+            AssertBottom();
+            nextMaintAt = DateTime.Now.AddSeconds(1);
+        }
+
+        if (zTest && ++zTick == 10) { WriteZTest(); Environment.Exit(0); }
+
+        // 只在整秒（或整分）边界刷新：秒针不再滞后 200ms，也不会持续漂移
+        if (now >= nextRenderAt)
+        {
+            DateTime cur = DateTime.Now;
+            string key = RenderKeyFor(cur);
+            if (key != renderKey) { renderKey = key; Render(); }
+            nextRenderAt = NextBoundary(cur);
+        }
+
+        ScheduleNextTick();
+    }
+
+    // 把下一次唤醒安排在最近的待办上：空闲时不再 5Hz 空转
+    static void ScheduleNextTick()
+    {
+        if (timer == null) return;
+        int ms;
+        if (zTest) ms = 200;
+        else
+        {
+            ms = 1000;
+            double a = (nextRenderAt - DateTime.Now).TotalMilliseconds;
+            if (a < ms) ms = (int)Math.Ceiling(a) + 4;
+            if (BottomMode)
+            {
+                double b = (nextMaintAt - DateTime.Now).TotalMilliseconds;
+                if (b < ms) ms = (int)Math.Ceiling(b) + 4;
+            }
+            if (ms < 30) ms = 30;   // WinForms Timer 分辨率约 15.6ms，别空转
+        }
+        if (timer.Interval != ms) timer.Interval = ms;
+    }
+
+    static void Dirty() { renderKey = ""; RefreshCapture(true, false); Render(); renderKey = RenderKeyFor(DateTime.Now); }
 
     static void Render()
     {
@@ -268,7 +369,7 @@ static class DeskClock
         finally { L.Dispose(); }
     }
 
-    // ---------------- 只在桌面获得焦点时显示 ----------------
+    // ---------------- 桌面判定（自检用） ----------------
     static bool IsDesktopClass(string cls)
     {
         if (cls == "Progman" || cls == "WorkerW" || cls == "SysListView32" || cls == "SHELLDLL_DefView") return true;
@@ -342,17 +443,6 @@ static class DeskClock
         if (zOrder == 2) SetWindowPos(form.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         else if (BottomMode) AssertBottom();
         renderKey = "";
-    }
-
-    static void ApplyVisibility()
-    {
-        if (form == null || shown) return;   // 正常一直显示；万一被谁藏了就拉回来
-        shown = true;
-        ShowWindow(form.Handle, SW_SHOWNOACTIVATE);
-        if (zOrder == 2) SetWindowPos(form.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        else if (BottomMode) AssertBottom();
-        renderKey = "";
-        Render();
     }
 
     // ---------------- 背景绘制（六种可选） ----------------
@@ -535,7 +625,7 @@ static class DeskClock
         if (form == null) return;
         if (!(bgKind == 2 || bgKind == 3)) { DisposeCapture(); srcOk = false; return; }
         if (!force && srcBlur != null && capW == surfW && capH == surfH) return;
-        bool was = shown;
+        bool was = IsWindowVisible(form.Handle);
         if (allowHide && was) ShowWindow(form.Handle, SW_HIDE);
         PrepareCapture();
         if (allowHide && was)
@@ -554,25 +644,43 @@ static class DeskClock
         public SizeF st, ss, sa, sd;
         public float rowH, gapSec, gapAm, gapY, padX, padY, sh, contentW, contentH;
         public int W, H;
+        public bool cached;               // 被 cache 持有：调用方 Dispose 时不释放字体
         public void Dispose()
         {
+            if (cached) return;
             if (fTime != null) fTime.Dispose();
             if (fSec != null) fSec.Dispose();
             if (fLabel != null) fLabel.Dispose();
         }
+        public void FillText(DateTime now)
+        {
+            t = hour24 ? now.ToString("HH:mm") : now.ToString("h:mm");
+            s = showSeconds ? now.ToString("ss") : "";
+            DateTimeFormatInfo dfi = CultureInfo.CurrentCulture.DateTimeFormat;
+            am = hour24 ? "" : (now.Hour < 12 ? dfi.AMDesignator : dfi.PMDesignator);
+            date = showDate ? (now.ToString("M月d日") + " " + dfi.GetDayName(now.DayOfWeek)) : "";
+        }
     }
 
+    // 字号 / 开关 / 卡片模式没变时复用同一份字体与测量结果，只重填时间文本
+    // （省掉原来每秒 3 个 Font + 4 次 MeasureString）
     static Layout Build(DateTime now, float baseS)
     {
+        string key = sizeIdx + "|" + (showSeconds ? 1 : 0) + "|" + (showDate ? 1 : 0) + "|" + (hour24 ? 1 : 0)
+            + "|" + (IsCardMode() ? 1 : 0) + "|" + baseS.ToString("0.###");
+        if (cacheLayout != null && key == cacheKey)
+        {
+            cacheLayout.FillText(now);
+            return cacheLayout;
+        }
+        if (cacheLayout != null) { cacheLayout.cached = false; cacheLayout.Dispose(); cacheLayout = null; }
+
         Layout L = new Layout();
+        L.cached = true;
         L.fTime = PickFont(baseS, true);
         L.fSec = PickFont(baseS * 0.46f, true);
         L.fLabel = PickFont(baseS * 0.33f, false);
-        L.t = hour24 ? now.ToString("HH:mm") : now.ToString("h:mm");
-        L.s = showSeconds ? now.ToString("ss") : "";
-        DateTimeFormatInfo dfi = CultureInfo.CurrentCulture.DateTimeFormat;
-        L.am = hour24 ? "" : (now.Hour < 12 ? dfi.AMDesignator : dfi.PMDesignator);
-        L.date = showDate ? (now.ToString("M月d日") + " " + dfi.GetDayName(now.DayOfWeek)) : "";
+        L.FillText(now);
 
         // 用“最宽形态”测量，避免数字宽度差异导致窗口每秒抖动
         L.st = measureG.MeasureString("88:88", L.fTime, PointF.Empty, typo);
@@ -594,6 +702,7 @@ static class DeskClock
         else { L.padX = baseS * 0.07f; L.padY = baseS * 0.05f; L.sh = baseS * 0.14f; }
         L.W = (int)Math.Ceiling(L.contentW + L.padX * 2 + L.sh * 2);
         L.H = (int)Math.Ceiling(L.contentH + L.padY * 2 + L.sh * 2);
+        cacheLayout = L; cacheKey = key;
         return L;
     }
 
@@ -760,106 +869,177 @@ static class DeskClock
         if (posY > maxY) posY = maxY;
     }
 
-    // ---------------- 右键菜单 ----------------
-    static void BuildMenu()
+    // ---------------- 右键菜单 / 托盘 ----------------
+    static ContextMenuStrip BuildContextMenu()
     {
-        menu = new ContextMenuStrip();
-        menu.ShowImageMargin = false;    // 不需要图片列
-        menu.ShowCheckMargin = true;     // 但必须保留对号列（默认关，关掉就对号全没）
-        menu.Font = PickFont(15f * scale, false);
+        ContextMenuStrip m = new ContextMenuStrip();
+        m.ShowImageMargin = false;    // 不需要图片列
+        m.ShowCheckMargin = true;     // 但必须保留对号列（默认关，关掉就对号全没）
+        m.Font = PickFont(14f * scale, false);
 
         ToolStripMenuItem miSec = new ToolStripMenuItem("显示秒");
-        miSec.CheckOnClick = true; miSec.Checked = showSeconds;
-        miSec.CheckedChanged += delegate { showSeconds = miSec.Checked; Dirty(); Save(); };
-        menu.Items.Add(miSec);
-
-        ToolStripMenuItem miDate = new ToolStripMenuItem("显示日期");
-        miDate.CheckOnClick = true; miDate.Checked = showDate;
-        miDate.CheckedChanged += delegate { showDate = miDate.Checked; Dirty(); Save(); };
-        menu.Items.Add(miDate);
-
-        ToolStripMenuItem mi24 = new ToolStripMenuItem("24 小时制");
-        mi24.CheckOnClick = true; mi24.Checked = hour24;
-        mi24.CheckedChanged += delegate { hour24 = mi24.Checked; Dirty(); Save(); };
-        menu.Items.Add(mi24);
-
-        menu.Items.Add(new ToolStripSeparator());
-
-        ToolStripMenuItem miBg = new ToolStripMenuItem("背景");
-        bgItems = new ToolStripMenuItem[BG_NAMES.Length];
-        for (int i = 0; i < BG_NAMES.Length; i++)
-        {
-            int idx = i;
-            ToolStripMenuItem it = new ToolStripMenuItem(BG_NAMES[i]);
-            it.Checked = (bgKind == i);
-            it.Click += delegate { bgKind = idx; renderKey = ""; RefreshCapture(true, true); SyncChecks(); Save(); Render(); };
-            miBg.DropDownItems.Add(it);
-            bgItems[i] = it;
-        }
-        menu.Items.Add(miBg);
-
-        ToolStripMenuItem miOp = new ToolStripMenuItem("不透明度");
-        opacityItems = new ToolStripMenuItem[OPACITY_NAMES.Length];
-        for (int i = 0; i < OPACITY_NAMES.Length; i++)
-        {
-            int idx = i;
-            ToolStripMenuItem it = new ToolStripMenuItem(OPACITY_NAMES[i]);
-            it.Checked = (bgOpacity == i);
-            it.Click += delegate { bgOpacity = idx; SyncChecks(); Dirty(); Save(); };
-            miOp.DropDownItems.Add(it);
-            opacityItems[i] = it;
-        }
-        menu.Items.Add(miOp);
+        miSec.Tag = "秒";
+        miSec.Click += delegate { showSeconds = !showSeconds; SyncChecks(); Dirty(); ScheduleSave(); };
+        m.Items.Add(miSec);
 
         ToolStripMenuItem miSize = new ToolStripMenuItem("字号");
-        sizeItems = new ToolStripMenuItem[SIZE_NAMES.Length];
         for (int i = 0; i < SIZE_NAMES.Length; i++)
         {
             int idx = i;
             ToolStripMenuItem it = new ToolStripMenuItem(SIZE_NAMES[i]);
-            it.Checked = (sizeIdx == i);
-            it.Click += delegate { sizeIdx = idx; SyncChecks(); Dirty(); Save(); };
+            it.Tag = "sz:" + i;
+            it.Click += delegate { sizeIdx = idx; SyncChecks(); Dirty(); ScheduleSave(); };
             miSize.DropDownItems.Add(it);
-            sizeItems[i] = it;
         }
-        menu.Items.Add(miSize);
+        m.Items.Add(miSize);
 
-        menu.Items.Add(new ToolStripSeparator());
+        m.Items.Add(new ToolStripSeparator());
 
         ToolStripMenuItem miLock = new ToolStripMenuItem("锁定位置");
-        miLock.CheckOnClick = true; miLock.Checked = locked;
-        miLock.CheckedChanged += delegate { locked = miLock.Checked; Save(); };
-        menu.Items.Add(miLock);
-
-        ToolStripMenuItem miZ = new ToolStripMenuItem("显示层级");
-        zItems = new ToolStripMenuItem[ZORDER_NAMES.Length];
-        for (int i = 0; i < ZORDER_NAMES.Length; i++)
-        {
-            int idx = i;
-            ToolStripMenuItem it = new ToolStripMenuItem(ZORDER_NAMES[i]);
-            it.Checked = (zOrder == i);
-            it.Click += delegate { zOrder = idx; ApplyZOrder(); ApplyVisibility(); SyncChecks(); Save(); };
-            miZ.DropDownItems.Add(it);
-            zItems[i] = it;
-        }
-        menu.Items.Add(miZ);
-
-
-        ToolStripMenuItem miAuto = new ToolStripMenuItem("开机自启");
-        miAuto.CheckOnClick = true;
-        miAuto.Checked = File.Exists(startupLnk);
-        miAuto.CheckedChanged += delegate { SetAutostart(miAuto.Checked); };
-        menu.Items.Add(miAuto);
+        miLock.Tag = "锁定";
+        miLock.Click += delegate { locked = !locked; SyncChecks(); ScheduleSave(); };
+        m.Items.Add(miLock);
 
         ToolStripMenuItem miReset = new ToolStripMenuItem("回到右上角");
         miReset.Click += delegate { posX = int.MinValue; Dirty(); Save(); };
-        menu.Items.Add(miReset);
+        m.Items.Add(miReset);
 
-        menu.Items.Add(new ToolStripSeparator());
+        m.Items.Add(new ToolStripSeparator());
+
+        ToolStripMenuItem miCfg = new ToolStripMenuItem("设置…");
+        miCfg.Click += delegate { ShowSettings(); };
+        m.Items.Add(miCfg);
+
+        ToolStripMenuItem miHide = new ToolStripMenuItem("隐藏时钟");
+        miHide.Tag = "隐藏";
+        miHide.Click += delegate { SetHidden(!hidden); };
+        m.Items.Add(miHide);
+
+        m.Items.Add(new ToolStripSeparator());
 
         ToolStripMenuItem miExit = new ToolStripMenuItem("退出");
         miExit.Click += delegate { form.Close(); };
-        menu.Items.Add(miExit);
+        m.Items.Add(miExit);
+
+        return m;
+    }
+
+    static void BuildMenu()
+    {
+        menu = BuildContextMenu();
+        SyncChecks();
+    }
+
+    // 所有菜单项靠 Tag 驱动对号，避免新增项忘了同步
+    static void SyncChecks()
+    {
+        SyncMenuItems(menu);
+        SyncMenuItems(trayMenu);
+        if (settings != null && !settings.IsDisposed) settings.RefreshFromState();
+    }
+
+    static void SyncMenuItems(ContextMenuStrip m)
+    {
+        if (m == null) return;
+        for (int i = 0; i < m.Items.Count; i++) SyncMenuItem(m.Items[i]);
+    }
+
+    static void SyncMenuItem(ToolStripItem item)
+    {
+        ToolStripMenuItem mi = item as ToolStripMenuItem;
+        if (mi == null) return;
+        string tag = mi.Tag as string;
+        if (tag != null)
+        {
+            if (tag == "秒") mi.Checked = showSeconds;
+            else if (tag == "锁定") mi.Checked = locked;
+            else if (tag == "隐藏") mi.Text = hidden ? "显示时钟" : "隐藏时钟";
+            else if (tag.StartsWith("sz:")) mi.Checked = (tag == "sz:" + sizeIdx);
+        }
+        for (int i = 0; i < mi.DropDownItems.Count; i++) SyncMenuItem(mi.DropDownItems[i]);
+    }
+
+    static void BuildTray()
+    {
+        msgTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
+        trayMenu = BuildContextMenu();
+        tray = new NotifyIcon();
+        tray.Icon = MakeTrayIcon();
+        tray.Text = "桌面时钟";
+        tray.ContextMenuStrip = trayMenu;
+        tray.Visible = true;
+        tray.MouseUp += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) ShowSettings();
+        };
+    }
+
+    static Icon MakeTrayIcon()
+    {
+        using (Bitmap b = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
+        {
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+                using (SolidBrush bg = new SolidBrush(Color.FromArgb(250, 34, 38, 48)))
+                    g.FillEllipse(bg, 1f, 1f, 30f, 30f);
+                using (Pen ring = new Pen(Color.FromArgb(245, 236, 238, 242), 2.2f))
+                    g.DrawEllipse(ring, 5.5f, 5.5f, 21f, 21f);
+                using (Pen hand = new Pen(Color.FromArgb(245, 236, 238, 242), 2.2f))
+                {
+                    hand.StartCap = LineCap.Round; hand.EndCap = LineCap.Round;
+                    g.DrawLine(hand, 16f, 16f, 16f, 9.5f);
+                    g.DrawLine(hand, 16f, 16f, 21f, 18.5f);
+                }
+            }
+            IntPtr h = b.GetHicon();
+            try { using (Icon tmp = Icon.FromHandle(h)) return (Icon)tmp.Clone(); }
+            finally { DestroyIcon(h); }
+        }
+    }
+
+    // explorer 重启后（ExplorerPatcher 会触发）托盘图标会消失，需要重新注册
+    static void ReAddTrayIcon()
+    {
+        if (tray == null) return;
+        try { tray.Visible = false; tray.Visible = true; } catch { }
+    }
+
+    // ---------------- 显示 / 隐藏 ----------------
+    static void SetHidden(bool h)
+    {
+        if (form == null) return;
+        hidden = h;
+        if (h) ShowWindow(form.Handle, SW_HIDE);
+        else
+        {
+            ShowWindow(form.Handle, SW_SHOWNOACTIVATE);
+            ApplyZOrder();
+            renderKey = "";
+            Render();
+            RefreshCapture(true, true);
+            nextRenderAt = NextBoundary(DateTime.Now);
+        }
+        SyncChecks();
+    }
+
+    static void ShowSettings()
+    {
+        if (settings == null || settings.IsDisposed)
+        {
+            settings = new SettingsForm();
+            settings.FormClosed += delegate { settings = null; };
+            settings.RefreshFromState();
+            settings.Show();
+        }
+        else
+        {
+            if (settings.WindowState == FormWindowState.Minimized) settings.WindowState = FormWindowState.Normal;
+            settings.RefreshFromState();
+            settings.Activate();
+        }
+        try { settings.BringToFront(); } catch { }
     }
 
     // ---------------- 菜单截图（自检用） ----------------
@@ -905,16 +1085,260 @@ static class DeskClock
         menu.Close();
         host.Close();
     }
-    static void SyncChecks()
+
+    // ---------------- 设置窗口截图（自检用） ----------------
+    static void MakeSettingsShot()
     {
-        if (bgItems != null)
-            for (int i = 0; i < bgItems.Length; i++) bgItems[i].Checked = (i == bgKind);
-        if (opacityItems != null)
-            for (int i = 0; i < opacityItems.Length; i++) opacityItems[i].Checked = (i == bgOpacity);
-        if (sizeItems != null)
-            for (int i = 0; i < sizeItems.Length; i++) sizeItems[i].Checked = (i == sizeIdx);
-        if (zItems != null)
-            for (int i = 0; i < zItems.Length; i++) zItems[i].Checked = (i == zOrder);
+        settings = new SettingsForm();
+        settings.Show();
+        settings.RefreshFromState();
+        Application.DoEvents();
+        System.Threading.Thread.Sleep(300);
+        Application.DoEvents();
+        using (Bitmap bmp = new Bitmap(settings.Width, settings.Height))
+        {
+            settings.DrawToBitmap(bmp, new Rectangle(0, 0, settings.Width, settings.Height));
+            bmp.Save(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "settings.png"), ImageFormat.Png);
+        }
+        settings.Close();
+    }
+
+    // ---------------- 设置窗口 ----------------
+    class SettingsForm : Form
+    {
+        bool syncing = false;
+        CheckBox cbSec, cbDate, cb24, cbLock, cbAuto;
+        RadioButton[] rbOp = new RadioButton[OPACITY_NAMES.Length];
+        RadioButton[] rbZ = new RadioButton[ZORDER_NAMES.Length];
+        Button[] btnBg = new Button[BG_NAMES.Length];
+        TrackBar tbSize;
+        Label lbSize;
+        Button btnHide, btnQuit, btnClose, btnReset;
+
+        int S(float v) { return (int)Math.Round(v * scale); }
+
+        void Place(Control c, int x, int y, int w, int h)
+        {
+            c.Bounds = new Rectangle(S(x), S(y), S(w), S(h));
+            Controls.Add(c);
+        }
+
+        void Section(string text, int y)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = PickFont(12.5f * scale, false);
+            l.ForeColor = Color.FromArgb(122, 124, 132);
+            l.TextAlign = ContentAlignment.MiddleLeft;
+            Place(l, 20, y, 400, 24);
+        }
+
+        CheckBox Check(string text, int x, int y, int w, bool value, EventHandler onChanged)
+        {
+            CheckBox c = new CheckBox();
+            c.Text = text;
+            c.Font = PickFont(13.5f * scale, false);
+            c.Checked = value;
+            c.CheckedChanged += onChanged;
+            Place(c, x, y, w, 28);
+            return c;
+        }
+
+        void Line(int y)
+        {
+            Panel p = new Panel();
+            p.BackColor = Color.FromArgb(228, 230, 235);
+            Place(p, 20, y, 420, 1);
+        }
+
+        void ActionButton(Button b, bool primary)
+        {
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderSize = 1;
+            b.FlatAppearance.BorderColor = primary ? Color.FromArgb(64, 102, 204) : Color.FromArgb(204, 207, 214);
+            b.UseVisualStyleBackColor = false;
+            b.BackColor = primary ? Color.FromArgb(72, 112, 216) : Color.White;
+            b.ForeColor = primary ? Color.White : Color.FromArgb(44, 46, 52);
+            b.Cursor = Cursors.Hand;
+        }
+        void BuildUi()
+        {
+            Section("显示", 12);
+            cbSec = Check("显示秒", 24, 42, 118, showSeconds,
+                delegate { if (syncing || cbSec == null) return; showSeconds = cbSec.Checked; Dirty(); ScheduleSave(); });
+            cbDate = Check("显示日期", 150, 42, 130, showDate,
+                delegate { if (syncing || cbDate == null) return; showDate = cbDate.Checked; Dirty(); ScheduleSave(); });
+            cb24 = Check("24 小时制", 290, 42, 140, hour24,
+                delegate { if (syncing || cb24 == null) return; hour24 = cb24.Checked; Dirty(); ScheduleSave(); });
+
+            Section("外观", 80);
+
+            Label lbBg = new Label();
+            lbBg.Text = "背景";
+            lbBg.Font = PickFont(13.5f * scale, false);
+            Place(lbBg, 24, 110, 60, 24);
+
+            for (int i = 0; i < BG_NAMES.Length; i++)
+            {
+                int idx = i;
+                Button b = new Button();
+                b.Text = BG_NAMES[i];
+                b.Font = PickFont(12.5f * scale, false);
+                b.FlatStyle = FlatStyle.Flat;
+                b.FlatAppearance.BorderSize = 1;
+                b.UseVisualStyleBackColor = false;
+                b.Click += delegate { if (syncing) return; bgKind = idx; renderKey = ""; RefreshCapture(true, true); Render(); SyncChecks(); Save(); };
+                Place(b, 24 + (i % 3) * 140, 136 + (i / 3) * 58, 132, 50);
+                btnBg[i] = b;
+            }
+
+            Label lbOp = new Label();
+            lbOp.Text = "不透明度";
+            lbOp.Font = PickFont(13.5f * scale, false);
+            Place(lbOp, 24, 254, 80, 24);
+
+            for (int i = 0; i < OPACITY_NAMES.Length; i++)
+            {
+                int idx = i;
+                RadioButton r = new RadioButton();
+                r.Text = OPACITY_NAMES[i];
+                r.Font = PickFont(13f * scale, false);
+                r.Checked = (bgOpacity == i);
+                r.CheckedChanged += delegate { if (syncing || !r.Checked) return; bgOpacity = idx; Dirty(); ScheduleSave(); };
+                Place(r, 108 + i * 82, 252, 78, 26);
+                rbOp[i] = r;
+            }
+
+            Label lbSz = new Label();
+            lbSz.Text = "字号";
+            lbSz.Font = PickFont(13.5f * scale, false);
+            Place(lbSz, 24, 290, 60, 24);
+
+            lbSize = new Label();
+            lbSize.Text = SIZE_NAMES[sizeIdx];
+            lbSize.Font = PickFont(13.5f * scale, false);
+            lbSize.TextAlign = ContentAlignment.MiddleLeft;
+            Place(lbSize, 336, 290, 90, 24);
+
+            tbSize = new TrackBar();
+            tbSize.Minimum = 0;
+            tbSize.Maximum = SIZES.Length - 1;
+            tbSize.TickStyle = TickStyle.None;
+            tbSize.SmallChange = 1;
+            tbSize.LargeChange = 1;
+            tbSize.Value = sizeIdx;
+            tbSize.ValueChanged += delegate
+            {
+                if (syncing) return;
+                sizeIdx = tbSize.Value;
+                if (lbSize != null) lbSize.Text = SIZE_NAMES[sizeIdx];
+                Dirty(); ScheduleSave();
+            };
+            Place(tbSize, 96, 282, 230, 40);
+
+            Section("位置与层级", 330);
+            for (int i = 0; i < ZORDER_NAMES.Length; i++)
+            {
+                int idx = i;
+                RadioButton r = new RadioButton();
+                r.Text = ZORDER_NAMES[i];
+                r.Font = PickFont(13f * scale, false);
+                r.Checked = (zOrder == i);
+                r.CheckedChanged += delegate { if (syncing || !r.Checked) return; zOrder = idx; ApplyZOrder(); SyncChecks(); Save(); };
+                Place(r, 24 + i * 130, 358, 126, 26);
+                rbZ[i] = r;
+            }
+
+            cbLock = Check("锁定位置", 24, 390, 140, locked,
+                delegate { if (syncing || cbLock == null) return; locked = cbLock.Checked; ScheduleSave(); });
+
+            btnReset = new Button();
+            btnReset.Text = "回到右上角";
+            btnReset.Font = PickFont(12.5f * scale, false);
+            btnReset.Click += delegate { posX = int.MinValue; Dirty(); Save(); };
+            Place(btnReset, 300, 386, 132, 30);
+
+            Section("启动", 424);
+            cbAuto = Check("开机自启", 24, 452, 200, AutostartPointsHere(),
+                delegate { if (syncing || cbAuto == null) return; SetAutostart(cbAuto.Checked); });
+
+            Line(486);
+
+            btnHide = new Button();
+            btnHide.Text = hidden ? "显示时钟" : "隐藏时钟";
+            btnHide.Font = PickFont(12.5f * scale, false);
+            btnHide.Click += delegate { SetHidden(!hidden); };
+            Place(btnHide, 24, 500, 120, 34);
+
+            btnQuit = new Button();
+            btnQuit.Text = "退出程序";
+            btnQuit.Font = PickFont(12.5f * scale, false);
+            btnQuit.Click += delegate { form.Close(); };
+            Place(btnQuit, 152, 500, 120, 34);
+
+            btnClose = new Button();
+            btnClose.Text = "关闭";
+            btnClose.Font = PickFont(12.5f * scale, false);
+            btnClose.Click += delegate { Close(); };
+            Place(btnClose, 316, 500, 120, 34);
+            ActionButton(btnReset, false);
+            ActionButton(btnHide, false);
+            ActionButton(btnQuit, false);
+            ActionButton(btnClose, true);
+        }
+
+        void StyleBg()
+        {
+            if (btnBg == null) return;
+            for (int i = 0; i < btnBg.Length; i++)
+            {
+                if (btnBg[i] == null) continue;
+                bool sel = (i == bgKind);
+                btnBg[i].BackColor = sel ? Color.FromArgb(234, 240, 255) : Color.White;
+                btnBg[i].FlatAppearance.BorderColor = sel ? Color.FromArgb(72, 112, 216) : Color.FromArgb(208, 211, 218);
+                btnBg[i].ForeColor = sel ? Color.FromArgb(28, 58, 148) : Color.FromArgb(44, 46, 52);
+            }
+        }
+
+        public void RefreshFromState()
+        {
+            if (IsDisposed) return;
+            syncing = true;
+            try
+            {
+                if (cbSec != null) cbSec.Checked = showSeconds;
+                if (cbDate != null) cbDate.Checked = showDate;
+                if (cb24 != null) cb24.Checked = hour24;
+                StyleBg();
+                for (int i = 0; i < rbOp.Length; i++) if (rbOp[i] != null) rbOp[i].Checked = (i == bgOpacity);
+                if (tbSize != null) tbSize.Value = sizeIdx;
+                if (lbSize != null) lbSize.Text = SIZE_NAMES[sizeIdx];
+                for (int i = 0; i < rbZ.Length; i++) if (rbZ[i] != null) rbZ[i].Checked = (i == zOrder);
+                if (cbLock != null) cbLock.Checked = locked;
+                if (cbAuto != null) cbAuto.Checked = AutostartPointsHere();
+                if (btnHide != null) btnHide.Text = hidden ? "显示时钟" : "隐藏时钟";
+            }
+            finally { syncing = false; }
+        }
+
+        public SettingsForm()
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = true;
+            StartPosition = FormStartPosition.CenterScreen;
+            Text = "桌面时钟 · 设置";
+            BackColor = Color.FromArgb(250, 250, 251);
+            Font = PickFont(13.5f * scale, false);
+            ClientSize = new Size(S(460), S(552));
+
+            syncing = true;
+            BuildUi();
+            syncing = false;
+            RefreshFromState();
+        }
     }
 
     static void SetAutostart(bool on)
@@ -938,6 +1362,44 @@ static class DeskClock
         catch { }
     }
 
+    static string ShortcutTarget(string lnk)
+    {
+        try
+        {
+            Type t = Type.GetTypeFromProgID("WScript.Shell");
+            if (t == null) return null;
+            object sh = Activator.CreateInstance(t);
+            object sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, sh, new object[] { lnk });
+            return (string)sc.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, sc, null);
+        }
+        catch { return null; }
+    }
+
+    // 启动时自愈：exe 被挪了位置，Startup 里的快捷方式还指着已经不存在的旧路径时才重写
+    static bool AutostartPointsHere()
+    {
+        try
+        {
+            if (!File.Exists(startupLnk)) return false;
+            string tgt = ShortcutTarget(startupLnk);
+            if (string.IsNullOrEmpty(tgt)) return false;
+            return string.Equals(Path.GetFullPath(tgt).TrimEnd('\\'), Path.GetFullPath(Application.ExecutablePath).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+    static void HealAutostart()
+    {
+        try
+        {
+            if (!File.Exists(startupLnk)) return;
+            string tgt = ShortcutTarget(startupLnk);
+            if (string.IsNullOrEmpty(tgt)) return;
+            if (File.Exists(tgt)) return;   // 目标还在（哪怕是另一份拷贝）就别动它
+            SetAutostart(true);             // 目标已失效（多半是挪了文件夹）→ 重指到当前 exe
+        }
+        catch { }
+    }
+
     // ---------------- 设置存取 ----------------
     static void Save()
     {
@@ -955,7 +1417,15 @@ static class DeskClock
             sb.AppendLine("locked=" + (locked ? 1 : 0));
             sb.AppendLine("zorder=" + zOrder);
             if (posX != int.MinValue) { sb.AppendLine("x=" + posX); sb.AppendLine("y=" + posY); }
-            File.WriteAllText(settingsPath, sb.ToString(), Encoding.UTF8);
+            // 先写临时文件再替换，避免断电/崩溃留下半截 ini
+            string tmp = settingsPath + ".tmp";
+            File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
+            if (File.Exists(settingsPath))
+            {
+                try { File.Replace(tmp, settingsPath, null); }
+                catch { File.Copy(tmp, settingsPath, true); File.Delete(tmp); }
+            }
+            else File.Move(tmp, settingsPath);
         }
         catch { }
     }
@@ -1217,7 +1687,12 @@ static class DeskClock
         // 桌面底层模式：z 序一旦被改动就打标记，交给主循环重新摆位
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_WINDOWPOSCHANGED && BottomMode && !sinking) zDirty = true;
+            if (msgTaskbarCreated != 0 && m.Msg == msgTaskbarCreated) ReAddTrayIcon();
+            if (m.Msg == WM_WINDOWPOSCHANGED && BottomMode && !sinking)
+            {
+                zDirty = true;
+                if (timer != null && timer.Interval > 30) timer.Interval = 1;   // 立刻纠正，别等下一次轮询
+            }
             base.WndProc(ref m);
         }
     }
@@ -1243,4 +1718,6 @@ static class DeskClock
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int idx);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int RegisterWindowMessage(string name);
+    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr hIcon);
 }
