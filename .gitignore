@@ -1,0 +1,16 @@
+# build / run artifacts
+*.pdb
+*.user
+*.suo
+.vs/
+
+# self-test outputs
+selftest.txt
+vistest.txt
+ztest.txt
+menu.png
+menu-sub*.png
+
+# OS junk
+Thumbs.db
+desktop.ini
